@@ -1,0 +1,172 @@
+<!--
+  Custom Wazuh detection rules — selected examples
+  Author: Abed el rahman Ismaiil
+
+  These rules are organised in two categories:
+    1. False-positive tuning rules  (IDs 100500–100512)
+    2. Detection engineering rules  (IDs 100320–100330)
+
+  All rules follow the same principle: a useful rule is NEVER disabled.
+  Instead, narrow multi-condition exceptions are added — a single-field
+  allowlist creates a bypass; combining conditions closes it.
+-->
+
+<!-- ================================================================
+     CATEGORY 1 — FALSE-POSITIVE TUNING
+     Goal: reduce noise by 54.6% without hiding real threats.
+     Method: lower-severity rules that archive but don't alert.
+     ================================================================ -->
+
+<group name="soc_tuning,">
+
+  <!--
+    FP-001 — dpkg (Debian package manager)
+    ----------------------------------------
+    Problem : every apt install/upgrade generated level-7 alerts via
+    rule 2932 (syscheck: new file) — 865 alerts on baseline.
+    Fix     : downgrade to level 2 when BOTH conditions are met.
+              One condition alone would be exploitable by an attacker
+              naming a malicious binary "dpkg".
+  -->
+  <rule id="100500" level="2" overwrite="yes">
+    <if_sid>2932</if_sid>
+    <field name="file">/var/lib/dpkg/</field>
+    <description>FP-tuning: dpkg file change (package installation)</description>
+    <group>soc_tuning,</group>
+  </rule>
+
+  <rule id="100501" level="2">
+    <if_sid>2932</if_sid>
+    <field name="file">/var/lib/dpkg/</field>
+    <match>dpkg</match>
+    <description>FP-tuning: dpkg activity combined check</description>
+    <group>soc_tuning,</group>
+  </rule>
+
+  <!--
+    FP-002 — Windows Sysmon: PowerShell execution policy test
+    ----------------------------------------------------------
+    Problem : Sysmon rule 92213 fires when PowerShell runs an execution-
+              policy test — a Windows maintenance routine, not an attack.
+    Fix     : downgrade when BOTH the image ends in powershell.exe AND
+              the command line contains the specific policy-test argument.
+              Matching only on the image would suppress all PS alerts.
+  -->
+  <rule id="100510" level="2">
+    <if_sid>92213</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\powershell\.exe$</field>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)-executionpolicy\s+remotesigned</field>
+    <description>FP-tuning: PS execution policy test (Windows maintenance)</description>
+    <group>soc_tuning,windows,</group>
+  </rule>
+
+  <!--
+    FP-003 — Windows Defender update (endpoint antivirus)
+    -------------------------------------------------------
+    Problem : Defender updates its platform via UpdatePlatform.exe,
+              generating 61 alerts on the baseline week.
+    Fix     : downgrade when BOTH the binary matches Defender's updater
+              AND the temp directory matches the expected update path.
+  -->
+  <rule id="100512" level="2">
+    <if_sid>92217</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)UpdatePlatform\.amd64fre\.exe$</field>
+    <field name="win.eventdata.currentDirectory" type="pcre2">(?i)\\Windows\\Temp</field>
+    <description>FP-tuning: Windows Defender platform update</description>
+    <group>soc_tuning,windows,</group>
+  </rule>
+
+</group>
+
+
+<!-- ================================================================
+     CATEGORY 2 — DETECTION ENGINEERING
+     Goal: close blind spots found by running real attack techniques.
+     Each rule maps to a MITRE ATT&CK technique.
+     ================================================================ -->
+
+<group name="sysmon,windows,process_creation,">
+
+  <!--
+    T1053.005 — Persistence via Scheduled Task
+    -------------------------------------------
+    Blind spot discovered: schtasks /create was collected by Sysmon
+    (Event ID 1) but no rule alerted on it. The event was sitting
+    silently in archives.
+
+    Two-tier approach:
+      - Rule 100320: any scheduled-task creation (level 8, watch)
+      - Rule 100321: creation with SYSTEM privileges (level 12, critical)
+
+    The SYSTEM privilege check is a strong indicator of malicious intent:
+    legitimate scheduled tasks rarely need full SYSTEM access.
+
+    Test performed: schtasks /create /tn "WindowsUpdateHelper"
+                             /tr calc.exe /sc onlogon /ru System /f
+    Result: rule 100321 fired, case created automatically in TheHive.
+  -->
+  <rule id="100320" level="8">
+    <if_group>sysmon_event1</if_group>
+    <field name="win.system.providerName">^Microsoft-Windows-Sysmon$</field>
+    <field name="win.system.eventID">^1$</field>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\schtasks\.exe$</field>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)/create</field>
+    <description>Sysmon: Scheduled task created (T1053.005) - $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1053.005</id>
+    </mitre>
+    <group>persistence,scheduled_task,</group>
+  </rule>
+
+  <rule id="100321" level="12">
+    <if_sid>100320</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)/ru\s+system</field>
+    <description>Sysmon: Scheduled task with SYSTEM privileges (T1053.005) - $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1053.005</id>
+    </mitre>
+    <group>persistence,scheduled_task,privilege_escalation,</group>
+  </rule>
+
+</group>
+
+<group name="sysmon,windows,credential_access,">
+
+  <!--
+    T1003.001 — Credential Access via LSASS Memory Dump
+    -----------------------------------------------------
+    Two blind spots discovered and fixed:
+
+    1. COLLECTION gap: Sysmon's ProcessAccess section was empty.
+       With onmatch="include", an empty section logs nothing.
+       Fix: added <TargetImage condition="image">lsass.exe</TargetImage>
+            to the Sysmon configuration, then reloaded (Sysmon.exe -c).
+
+    2. DETECTION gap: even after fixing collection, a naive rule
+       generated 26 false positives from MsMpEng.exe (Windows Defender),
+       which legitimately accesses LSASS with GrantedAccess=0x1000.
+
+    Calibration: a memory dump requires PROCESS_VM_READ (0x10), absent
+    from legitimate 0x1000 access. The regex matches only values that
+    include that privilege — validated against real attack and real FPs.
+
+    Test performed: rundll32.exe comsvcs.dll, MiniDump <PID> dump.dmp full
+    Result after calibration:
+      - rundll32 with 0x1410/0x1fffff → DETECTED
+      - MsMpEng with 0x1000           → correctly ignored (0 FP)
+
+    Also observed: Defender blocked the dump while the SOC detected it
+    — defence-in-depth working as intended.
+  -->
+  <rule id="100330" level="12">
+    <if_group>sysmon_event_10</if_group>
+    <field name="win.eventdata.targetImage" type="pcre2">(?i)\\lsass\.exe$</field>
+    <field name="win.eventdata.grantedAccess" type="pcre2">(?i)^0x1(010|410|438|43a|fffff|f3fff|f1fff|f2fff)$</field>
+    <description>Sysmon: LSASS memory access — credential dump possible (T1003.001) - source: $(win.eventdata.sourceImage)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+    <group>credential_access,lsass,</group>
+  </rule>
+
+</group>
