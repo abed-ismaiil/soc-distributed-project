@@ -115,7 +115,7 @@ I ran real attack techniques against the lab, observed that some went **undetect
 
 ```
 ├── docs/
-│   └── architecture.png        Architecture diagram and data flows
+│   └── final-architecture.png        Architecture diagram and data flows
 ├── examples/
 │   ├── detection-rules/        Selected Wazuh detection rules (tuning + MITRE coverage)
 │   └── integration/            Representative excerpt of the custom integration script
