@@ -16,7 +16,7 @@ The goal: reproduce, at small scale, the engineering discipline behind a SOC tha
 
 ## Architecture
 
-![Architecture and data flow](docs/architecture.png)
+![Architecture and data flow](docs/final-architecture.png)
 
 Six machines on an isolated lab network — **five virtual machines and one physical host** — each with a dedicated role:
 
